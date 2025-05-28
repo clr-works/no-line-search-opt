@@ -1,13 +1,14 @@
 import numpy as np
 from typing import Dict, Tuple, List
 from dataclasses import dataclass
-from os.path  import join
+from os.path import join
 import pickle
 from loader import MnistDataloader
 from preprocessing import prepare_data, one_hot_encode
 from helper_functions import *
 from memory_profiler import profile
 import time
+import pandas as pd
 
 
 @dataclass
@@ -20,20 +21,156 @@ class DavidonState:
     E_prime0: float  # Previous directional derivative
 
 
+class DavidonDebugger:
+    """Debug logger for Davidon optimizer"""
+
+    def __init__(self):
+        self.history = {
+            'iteration': [],
+            'cost': [],
+            'grad_norm': [],
+            'direction_norm': [],
+            'step_size': [],
+            'E_prime0': [],
+            'backtrack_count': [],
+            'update_type': [],  # 'davidon' or 'gradient_descent'
+            'J_condition_number': [],
+            'param_norms': {},
+            'grad_norms': {},
+            'update_norms': {}
+        }
+
+    def log_iteration(self, iteration: int, cost: float, grad_vector: np.ndarray,
+                      direction: np.ndarray, step_size: float, E_prime0: float,
+                      backtrack_count: int, update_type: str, J: np.ndarray):
+        """Log data for current iteration"""
+        self.history['iteration'].append(iteration)
+        self.history['cost'].append(cost)
+        self.history['grad_norm'].append(np.linalg.norm(grad_vector))
+        self.history['direction_norm'].append(np.linalg.norm(direction))
+        self.history['step_size'].append(step_size)
+        self.history['E_prime0'].append(E_prime0)
+        self.history['backtrack_count'].append(backtrack_count)
+        self.history['update_type'].append(update_type)
+
+        # Compute condition number of J (expensive, do sparingly)
+        if iteration % 10 == 0:
+            try:
+                cond = np.linalg.cond(J[:100, :100])  # Use subset for efficiency
+            except:
+                cond = np.inf
+            self.history['J_condition_number'].append(cond)
+        else:
+            self.history['J_condition_number'].append(None)
+
+    def log_parameters(self, iteration: int, params: Dict, grads: Dict,
+                       updates: Dict[str, np.ndarray]):
+        """Log parameter-specific data"""
+        for key in params:
+            if key == 'J':
+                continue
+
+            # Initialize if needed
+            if key not in self.history['param_norms']:
+                self.history['param_norms'][key] = []
+                self.history['grad_norms'][f'd{key}'] = []
+                self.history['update_norms'][key] = []
+
+            # Log norms
+            self.history['param_norms'][key].append(np.linalg.norm(params[key]))
+
+            grad_key = f'd{key}'
+            if grad_key in grads:
+                self.history['grad_norms'][grad_key].append(np.linalg.norm(grads[grad_key]))
+
+            if key in updates:
+                self.history['update_norms'][key].append(np.linalg.norm(updates[key]))
+
+    def save_to_csv(self, filename_prefix: str = "davidon_debug"):
+        """Save debugging data to CSV files"""
+        # Main iteration data
+        main_df = pd.DataFrame({
+            'iteration': self.history['iteration'],
+            'cost': self.history['cost'],
+            'grad_norm': self.history['grad_norm'],
+            'direction_norm': self.history['direction_norm'],
+            'step_size': self.history['step_size'],
+            'E_prime0': self.history['E_prime0'],
+            'backtrack_count': self.history['backtrack_count'],
+            'update_type': self.history['update_type'],
+            'J_condition_number': self.history['J_condition_number']
+        })
+        main_df.to_csv(f"{filename_prefix}_main.csv", index=False)
+
+        # Parameter norms
+        param_df = pd.DataFrame(self.history['param_norms'])
+        param_df['iteration'] = range(len(param_df))
+        param_df.to_csv(f"{filename_prefix}_params.csv", index=False)
+
+        # Gradient norms
+        grad_df = pd.DataFrame(self.history['grad_norms'])
+        grad_df['iteration'] = range(len(grad_df))
+        grad_df.to_csv(f"{filename_prefix}_grads.csv", index=False)
+
+        # Update norms
+        update_df = pd.DataFrame(self.history['update_norms'])
+        update_df['iteration'] = range(len(update_df))
+        update_df.to_csv(f"{filename_prefix}_updates.csv", index=False)
+
+        print(f"Debug data saved to {filename_prefix}_*.csv files")
+
+
+def analyze_davidon_behavior(optimizer, grad_vector, J):
+    """Analyze why Davidon updates might be failing"""
+    print("\n=== Davidon Analysis ===")
+
+    # Check gradient magnitude
+    print(f"Gradient norm: {np.linalg.norm(grad_vector):.6f}")
+
+    # Check J properties
+    print(f"J shape: {J.shape}")
+    print(f"J diagonal sample: {np.diag(J)[:5]}")
+
+    # Check if J is well-conditioned
+    try:
+        eigenvalues = np.linalg.eigvalsh(J[:100, :100])  # Check small submatrix
+        print(f"J eigenvalue range: [{eigenvalues.min():.6f}, {eigenvalues.max():.6f}]")
+        print(f"J condition number (subset): {eigenvalues.max() / eigenvalues.min():.2e}")
+    except:
+        print("Could not compute eigenvalues")
+
+    # Check search direction
+    k = J @ grad_vector
+    print(f"k = J @ grad norm: {np.linalg.norm(k):.6f}")
+    angle = np.arccos(np.clip(np.dot(grad_vector, k) / (np.linalg.norm(grad_vector) * np.linalg.norm(k)), -1, 1))
+    print(f"Angle between grad and k: {angle * 180 / np.pi:.2f} degrees")
+
+    return k
+
+
 class DavidonOptimizer:
     """
     Davidon's Quasi-Newton optimizer without line searches
     Based on "Optimally Conditioned Optimization Algorithms Without Line Searches" (1975)
     """
 
-    def __init__(self, total_params: int, epsilon: float = 1e-6, max_iterations: int = 100):
+    def __init__(self, total_params: int, epsilon: float = 1e-6, max_iterations: int = 100, debug: bool = True):
         self.epsilon = epsilon
         self.max_iterations = max_iterations
         self.iteration = 0
+        self.min_step_size = 1e-8  # Minimum step size to prevent vanishing updates
+        self.max_backtracks = 10  # Limit backtracking iterations
+        self.gradient_descent_count = 0  # Track fallbacks
+        self.debug = debug
+
+        if self.debug:
+            self.debugger = DavidonDebugger()
 
         # Initialize with scaled identity for better conditioning
+        # Scale based on expected gradient magnitude
+        scale = 0.1  # Conservative initial scale
         self.state = DavidonState(
-            J=np.eye(total_params, dtype=np.float32),  # Use float32 for better precision
+            J=np.eye(total_params, dtype=np.float32) * scale,
             k0=None,
             omega=None,
             E0=float('inf'),
@@ -62,11 +199,19 @@ class DavidonOptimizer:
         # Flatten gradients
         grad_vector = self._flatten_gradients(grads, structure_cache)
 
+        # DEBUG: Analyze gradient and J
+        if self.debug and self.iteration < 5:
+            print(f"\n=== Iteration {self.iteration} ===")
+            print(f"Initial cost: {cost:.6f}")
+            analyze_davidon_behavior(self, grad_vector, self.state.J)
+
         # First iteration initialization
         if self.state.k0 is None:
             self.state.k0 = self.state.J @ grad_vector
             self.state.omega = self.state.k0.copy()
             self.state.E0 = cost
+            if self.debug:
+                print(f"Initial k0 norm: {np.linalg.norm(self.state.k0):.6f}")
 
         # Compute search direction
         if self.iteration == 0:
@@ -74,8 +219,14 @@ class DavidonOptimizer:
         else:
             s = self._compute_search_direction(grad_vector)
 
+        if self.debug:
+            print(f"Search direction norm: {np.linalg.norm(s):.6f}")
+
         # Check convergence
         E_prime0 = np.dot(self.state.k0, s)
+        if self.debug:
+            print(f"E_prime0 (directional derivative): {E_prime0:.6f}")
+
         if abs(E_prime0) < self.epsilon:
             print(f"Converged at iteration {self.iteration}")
             return parameters, cost
@@ -84,6 +235,8 @@ class DavidonOptimizer:
         if 4 * self.state.E0 < -E_prime0:
             s = -4 * s * (self.state.E0 / E_prime0)
             E_prime0 = np.dot(self.state.k0, s)
+            if self.debug:
+                print(f"Adjusted step, new E_prime0: {E_prime0:.6f}")
 
         # Update parameters
         new_params = self._update_parameters(parameters, structure_cache, s)
@@ -94,14 +247,51 @@ class DavidonOptimizer:
 
         # Backtracking if cost increased
         lambda_factor = 1.0
-        while new_cost > self.state.E0 and lambda_factor > 1e-8:
+        backtrack_count = 0
+        original_s = s.copy()  # Save original direction
+        update_type = 'davidon'
+
+        while new_cost > self.state.E0 and backtrack_count < self.max_backtracks:
             lambda_factor *= 0.5
-            s *= 0.5
-            E_prime0 *= 0.5
+            s = original_s * lambda_factor  # Scale from original
 
             new_params = self._update_parameters(parameters, structure_cache, s)
             AL, _ = forward_fn(x_train, new_params)
             new_cost = cost_fn(AL, y_train)
+
+            backtrack_count += 1
+            if self.debug and backtrack_count <= 3:
+                print(f"  Backtrack {backtrack_count}: lambda={lambda_factor:.6f}, cost={new_cost:.6f}")
+
+        # If still no improvement, use gradient descent step
+        if new_cost > self.state.E0 and backtrack_count >= self.max_backtracks:
+            self.gradient_descent_count += 1
+            update_type = 'gradient_descent'
+            print(f"  WARNING: Davidon step failed after {backtrack_count} backtracks")
+            print(f"  Falling back to gradient descent (total fallbacks: {self.gradient_descent_count})")
+            s = -grad_vector * 0.01  # Small gradient step
+            new_params = self._update_parameters(parameters, structure_cache, s)
+            AL, _ = forward_fn(x_train, new_params)
+            new_cost = cost_fn(AL, y_train)
+            print(f"  Gradient descent cost: {new_cost:.6f} (vs Davidon attempt: {self.state.E0:.6f})")
+
+        # Log debug information
+        if self.debug:
+            self.debugger.log_iteration(
+                self.iteration, new_cost, grad_vector, s, lambda_factor,
+                E_prime0, backtrack_count, update_type, self.state.J
+            )
+
+            # Extract update information
+            updates = {}
+            start = 0
+            for grad_key, shape in structure_cache:
+                param_key = grad_key[1:]
+                size = np.prod(shape)
+                updates[param_key] = s[start:start + size].reshape(shape)
+                start += size
+
+            self.debugger.log_parameters(self.iteration, new_params, grads, updates)
 
         # Update Jacobian approximation
         if new_cost < self.state.E0:
@@ -124,23 +314,45 @@ class DavidonOptimizer:
         return np.concatenate(flattened)
 
     def _update_parameters(self, params: Dict, structure_cache: List,
-                           direction: np.ndarray, learning_rate: float = 0.01) -> Dict:
+                           direction: np.ndarray, step_size: float = 1.0) -> Dict:
         """Update parameters using the search direction"""
-        new_params = params.copy()
+        import copy
+        new_params = copy.deepcopy(params)
 
         # Remove J from parameters if it exists
         if 'J' in new_params:
             del new_params['J']
 
+        # DEBUG: Check direction magnitude
+        dir_norm = np.linalg.norm(direction)
+        if self.iteration < 5:  # Only print first few iterations
+            print(f"Update direction norm: {dir_norm:.6f}, step_size: {step_size:.6f}")
+
         start = 0
+        total_update_norm = 0
         for grad_key, shape in structure_cache:
             param_key = grad_key[1:]  # Remove 'd' prefix
 
             size = np.prod(shape)
             segment = direction[start:start + size].reshape(shape)
 
-            new_params[param_key] = params[param_key] + learning_rate * segment
+            if self.iteration < 5:  # Detailed logging for first few iterations
+                update_norm = np.linalg.norm(segment)
+                param_norm = np.linalg.norm(params[param_key])
+                # Avoid division by zero for bias terms
+                relative_update = update_norm / (param_norm + 1e-8)
+
+                print(
+                    f"  {param_key}: update_norm={update_norm:.6f}, param_norm={param_norm:.6f}, relative={relative_update:.6f}")
+
+            # Apply update with step size
+            new_params[param_key] = params[param_key] + step_size * segment
+
+            total_update_norm += np.linalg.norm(segment) ** 2
             start += size
+
+        if self.iteration < 5:
+            print(f"Total update norm: {np.sqrt(total_update_norm):.6f}")
 
         return new_params
 
@@ -186,6 +398,7 @@ def train_with_davidon(model_forward, model_backward, compute_cost,
         parameters: Optimized parameters
         train_costs: Training cost history
         test_costs: Test cost history
+        optimizer: The optimizer object (for debugging)
     """
 
     # Get initial cost and gradients
@@ -203,8 +416,9 @@ def train_with_davidon(model_forward, model_backward, compute_cost,
     # Calculate total parameters
     total_params = sum(np.prod(shape) for _, shape in structure_cache)
 
-    # Initialize optimizer
-    optimizer = DavidonOptimizer(total_params, epsilon, max_iterations)
+    # Initialize optimizer with adjusted epsilon for convergence
+    # Use larger epsilon to avoid premature convergence
+    optimizer = DavidonOptimizer(total_params, epsilon=1e-4, max_iterations=max_iterations, debug=True)
 
     # Training history
     train_costs = [cost]
@@ -246,12 +460,20 @@ def train_with_davidon(model_forward, model_backward, compute_cost,
         if iteration % 10 == 0:
             print(f"Iteration {iteration} - Train Cost: {cost:.4f}, Test Cost: {test_cost:.4f}")
 
-        # Check convergence
-        if len(train_costs) > 1 and abs(train_costs[-1] - train_costs[-2]) < epsilon:
-            print(f"Converged at iteration {iteration}")
-            break
+        # Check convergence based on cost change, not just parameter change
+        if len(train_costs) > 10:  # Wait for some iterations
+            recent_costs = train_costs[-10:]
+            cost_variance = np.var(recent_costs)
+            if cost_variance < epsilon ** 2:
+                print(f"Converged at iteration {iteration} - cost variance: {cost_variance:.2e}")
+                break
 
-    return parameters, train_costs, test_costs
+    # Save debug data before returning
+    if hasattr(optimizer, 'debugger'):
+        print("\nSaving debug data...")
+        optimizer.debugger.save_to_csv("davidon_debug")
+
+    return parameters, train_costs, test_costs, optimizer  # Return optimizer too
 
 
 # Example usage in main script:
@@ -281,14 +503,22 @@ if __name__ == '__main__':
     # Initialize the parameters
     parameters = initialize_parameters_davidon(units_in_layer)
 
-    # Train with Davidon's method
-    optimized_params, train_history, test_history = train_with_davidon(
+    # Train with Davidon's method - now captures the optimizer too
+    optimized_params, train_history, test_history, optimizer = train_with_davidon(
         Model_forward, Model_backward, compute_cost,
         x_train_flattened, one_hot_encoded_y_train.T,
         x_test_flattened, one_hot_encoded_y_test.T,
         parameters, units_in_layer,
         epsilon=1e-6, max_iterations=100
     )
+
+    # Print training summary
+    print(f"\nTraining Summary:")
+    print(f"Total iterations: {optimizer.iteration}")
+    print(f"Gradient descent fallbacks: {optimizer.gradient_descent_count}")
+    if optimizer.iteration > 0:
+        print(
+            f"Davidon success rate: {(optimizer.iteration - optimizer.gradient_descent_count) / optimizer.iteration * 100:.1f}%")
 
     # Evaluate final accuracy
     predictions_train = predict(x_train_flattened, optimized_params)
@@ -298,3 +528,15 @@ if __name__ == '__main__':
     accuracy_test = compute_accuracy(predictions_test, y_test_flattened)
 
     print(f"\nFinal Accuracy - Train: {accuracy_train:.4f}, Test: {accuracy_test:.4f}")
+
+    # Save results
+    Data_to_save = {
+        'parameters': optimized_params,
+        'train_costs': train_history,
+        'test_costs': test_history,
+        'final_train_accuracy': accuracy_train,
+        'final_test_accuracy': accuracy_test
+    }
+
+    with open(f'davidon_results_{units_in_layer}.pickle', 'wb') as file:
+        pickle.dump(Data_to_save, file)
