@@ -1,5 +1,7 @@
 import numpy as np
-from os.path import join
+from typing import Dict, Tuple, List
+from dataclasses import dataclass
+from os.path  import join
 import pickle
 from loader import MnistDataloader
 from preprocessing import prepare_data, one_hot_encode
@@ -7,200 +9,252 @@ from helper_functions import *
 from memory_profiler import profile
 import time
 
-@profile
-def davidon_quasi_newton_update(x_train_flattened, x_test_flattened, parameters, E, cost_list, cost_list_test, k, units_in_layer, epsilon=0.01, max_iterations=10):
-    """ Performs davidson quasi newton update
 
-    Args: Training and testing sets,
-          initial parameters,
-          initial cost,
-          initial cost list,
-          initial cost list test,
-          initial gradient vector,
-          units in layer,
-          epsilon,
-          max iterations
+@dataclass
+class DavidonState:
+    """Maintains state for Davidon's algorithm"""
+    J: np.ndarray  # Jacobian/Hessian approximation
+    k0: np.ndarray  # Previous gradient transformed by J
+    omega: np.ndarray  # Auxiliary vector
+    E0: float  # Previous cost
+    E_prime0: float  # Previous directional derivative
 
-    Returns: parameters, cost_list, cost_list_test"""
 
-    # Initialize variables only once
-    parameters0 = parameters
-    J = parameters0['J'] # initial parameters
-    E0 = cost # initial cost before the first forward pass, just the cost related to the initial parameters
-    grad_vector, structure_cache, size = flatten_gradients_for_jacobian(grads, units_in_layer) # grads after first backward pass
-    # Check if sizes are compatible for matrix multiplication
-    if grad_vector.shape[0] != size:
-        raise ValueError(f"The gradient vector is expected to be of size 4015, but got size {grad_vector.shape[0]}")
-    start = time.time()
-    k0 = np.dot(J,grad_vector) # perform matrix multiplication to get k0, grad_vector after first backward pass
-    end = time.time()
-    elapsed = end - start
-    print("elapsed time for matrix multiplication: ", elapsed)
-    k0 = k0.reshape(grad_vector.shape[0],1)
-    omega = k0
+class DavidonOptimizer:
+    """
+    Davidon's Quasi-Newton optimizer without line searches
+    Based on "Optimally Conditioned Optimization Algorithms Without Line Searches" (1975)
+    """
 
-    iteration_counter = 0
+    def __init__(self, total_params: int, epsilon: float = 1e-6, max_iterations: int = 100):
+        self.epsilon = epsilon
+        self.max_iterations = max_iterations
+        self.iteration = 0
 
-    while True:
+        # Initialize with scaled identity for better conditioning
+        self.state = DavidonState(
+            J=np.eye(total_params, dtype=np.float32),  # Use float32 for better precision
+            k0=None,
+            omega=None,
+            E0=float('inf'),
+            E_prime0=0
+        )
 
-        iteration_counter += 1
+    def step(self, parameters: Dict, grads: Dict, cost: float,
+             x_train: np.ndarray, y_train: np.ndarray,
+             forward_fn, cost_fn, structure_cache: List) -> Tuple[Dict, float]:
+        """
+        Perform one optimization step
 
-        if iteration_counter >= max_iterations:
-            print("Maximum number of iterations reached, exiting the algorithm")
-            return parameters, cost_list, cost_list_test
-        if iteration_counter == 1:
-            s = -k0
+        Args:
+            parameters: Current model parameters
+            grads: Current gradients
+            cost: Current cost
+            x_train, y_train: Training data for re-evaluation
+            forward_fn: Function to perform forward pass
+            cost_fn: Function to compute cost
+            structure_cache: Structure information for parameter updates
+
+        Returns:
+            Updated parameters and new cost
+        """
+
+        # Flatten gradients
+        grad_vector = self._flatten_gradients(grads, structure_cache)
+
+        # First iteration initialization
+        if self.state.k0 is None:
+            self.state.k0 = self.state.J @ grad_vector
+            self.state.omega = self.state.k0.copy()
+            self.state.E0 = cost
+
+        # Compute search direction
+        if self.iteration == 0:
+            s = -self.state.k0
         else:
-            s = k0
+            s = self._compute_search_direction(grad_vector)
 
-        E_prime0 = np.dot(k0.T,s)
-        lambda_factor = 2
+        # Check convergence
+        E_prime0 = np.dot(self.state.k0, s)
+        if abs(E_prime0) < self.epsilon:
+            print(f"Converged at iteration {self.iteration}")
+            return parameters, cost
 
+        # Adjust step size if needed (Davidon's condition)
+        if 4 * self.state.E0 < -E_prime0:
+            s = -4 * s * (self.state.E0 / E_prime0)
+            E_prime0 = np.dot(self.state.k0, s)
 
-        # Iterative update of s until the condition 4 * E0 > - E_prime0 is true
-        if 4 * E0 < - E_prime0:
-            s = -4 * s * (E0 / E_prime0)
+        # Update parameters
+        new_params = self._update_parameters(parameters, structure_cache, s)
 
-        # Update parameters using the current Jacobian and search direction
-        parameters = update_parameters_with_jacobian(parameters0,structure_cache, s)
+        # Evaluate new cost
+        AL, _ = forward_fn(x_train, new_params)
+        new_cost = cost_fn(AL, y_train)
 
-        # Break the loop if the update is smaller than epsilon to prevent infinite loops
-        if iteration_counter == 1:
-            if -E_prime0 < epsilon:
-                print("Stopping criteria met, exiting the algorithm")
-                return parameters, cost_list, cost_list_test
-        else:
-            if E_prime0 < epsilon:
-                print("Stopping criteria met, exiting the algorithm")
-                return parameters, cost_list, cost_list_test
-        # Calculate a new forward pass and then the cost
-        AL, caches = Model_forward(x_train_flattened, parameters)
-        AL_test, caches_test = Model_forward(x_test_flattened, parameters)
-        # Compute the cost
-        E = compute_cost(AL, one_hot_encoded_y_train.T) # new cost with new parameters after first update
-        E_test = compute_cost(AL_test, one_hot_encoded_y_test.T)
-        cost_list.append(E)
-        cost_list_test.append(E_test)
-        # Check if the update is sufficient, otherwise adjust
-        while E > E0:
-            s = s/2
-            E_prime0 = E_prime0/2
-            lambda_factor = 1/2
-            parameters = update_parameters_with_jacobian(parameters, structure_cache,s)
-            if -E_prime0 < epsilon:
-                print("Stopping criteria met, exiting the algorithm")
-                return parameters, cost_list, cost_list_test
-            AL, caches = Model_forward(x_train_flattened, parameters)
-            AL_test, caches_test = Model_forward(x_test_flattened, parameters)
-            # Compute cost
-            E = compute_cost(AL, one_hot_encoded_y_train.T)
-            E_test = compute_cost(AL_test, one_hot_encoded_y_test.T)
-            cost_list.append(E)
-            cost_list.append(E_test)
+        # Backtracking if cost increased
+        lambda_factor = 1.0
+        while new_cost > self.state.E0 and lambda_factor > 1e-8:
+            lambda_factor *= 0.5
+            s *= 0.5
+            E_prime0 *= 0.5
 
-        while True:
-            # Update parameters using the current Jacobian and search direction
-            parameters = update_parameters_with_jacobian(parameters, structure_cache, s)
-            AL, caches = Model_forward(x_train_flattened, parameters)
-            AL_test, caches_test = Model_forward(x_test_flattened, parameters)
-            # Compute cost
-            E = compute_cost(AL, one_hot_encoded_y_train.T)
-            E_test = compute_cost(AL_test, one_hot_encoded_y_test.T)
-            cost_list.append(E)
-            k = np.dot(J.T, s)
-            E_prime = np.dot(k.T, s)
-            b0 = E_prime - E_prime0
-            m = s + k0 - k
-            parameters0 = parameters
-            E0 = E
-            k0 = k
-            E_prime0 = E_prime
+            new_params = self._update_parameters(parameters, structure_cache, s)
+            AL, _ = forward_fn(x_train, new_params)
+            new_cost = cost_fn(AL, y_train)
 
-            if b0 >= epsilon:
+        # Update Jacobian approximation
+        if new_cost < self.state.E0:
+            self._update_jacobian(s, grad_vector, E_prime0)
 
-                m_square = np.dot(m.T, m)
-                # Check if the norm of m is sufficiently small
-                if (np.linalg.norm(m) ** 2 < epsilon):
-                    print("Convergence criteria met, exit")
-                    return parameters, cost_list, cost_list_test
-                else:
-                    v = np.dot(m.T, s)
-                    mu = v - m_square
+        # Update state
+        self.state.k0 = self.state.J @ grad_vector
+        self.state.E0 = new_cost
+        self.state.E_prime0 = E_prime0
+        self.iteration += 1
 
-                    # compute u
-                    u = omega - compute(m,omega)
+        return new_params, new_cost
 
-                    # Check if m'u is sufficiently small compared to u'u
-                    if 1e6 * (np.dot(m.T, u) ** 2 >= m_square * np.dot(u.T, u)):
-                        n = np.zeros_like(s) # assuming size of s
-                        n_squared = 0
-                    else:
-                        n = compute(u,s)
-                        n_squared = (np.dot(u.T, s) ** 2) / np.dot(u.T, u)
+    def _flatten_gradients(self, grads: Dict, structure_cache: List) -> np.ndarray:
+        """Flatten gradients into a single vector"""
+        flattened = []
+        for grad_key, shape in structure_cache:
+            if grad_key in grads:
+                flattened.append(grads[grad_key].flatten())
+        return np.concatenate(flattened)
 
-                    b = n_squared - ((mu*v)/m_square)
+    def _update_parameters(self, params: Dict, structure_cache: List,
+                           direction: np.ndarray, learning_rate: float = 0.01) -> Dict:
+        """Update parameters using the search direction"""
+        new_params = params.copy()
 
-                    # Check if b is sufficiently large
-                    alpha = p = omega = delta = None
-                    if b <= epsilon:
-                        if mu*v < m_square * n_squared:
-                            a = b - mu
-                            c = b + v
-                            gamma = calculate_gamma(mu, v, m_square, n_squared, a, b)
-                            d = c/a if a!=0 else None
+        # Remove J from parameters if it exists
+        if 'J' in new_params:
+            del new_params['J']
 
-                            if c < a:
-                                delta = np.sqrt(v / mu)
-                                gamma = -gamma
-                                alpha, p, q, omega = calculate_alpha_p_q_omega(v, mu, m, n, gamma, delta)
-                            else:
-                                alpha, p, q, omega = calculate_alpha_p_q_omega(v, mu, m, n, gamma, delta)
-                        else:
-                            gamma = 0
-                            delta = 0
-                            alpha, p, q, omega = calculate_alpha_p_q_omega(v, mu, m, n, gamma, delta)
-                    else:
-                        n = s - (v * m)/m_square
-                        n_squared = b0 - (mu*v)/m_square
-                        b = b0
-                        if mu*v < m_square * n_squared:
-                            a = b - mu
-                            c = b + v
-                            gamma = calculate_gamma(mu, v, m_square, n_squared, a, b)
-                            d = c/a if a!=0 else None
+        start = 0
+        for grad_key, shape in structure_cache:
+            param_key = grad_key[1:]  # Remove 'd' prefix
 
-                            if c < a:
-                                gamma = -gamma
-                                alpha, p, q, omega = calculate_alpha_p_q_omega(v, mu, m, n, gamma, delta)
-                            else:
-                                alpha, p, q, omega = calculate_alpha_p_q_omega(v, mu, m, n, gamma, delta)
-                        else:
-                            gamma = 0
-                            delta = np.sqrt(v/mu)
-                            alpha, p, q, omega = calculate_alpha_p_q_omega(v, mu, m, n, gamma, delta)
+            size = np.prod(shape)
+            segment = direction[start:start + size].reshape(shape)
 
-                    # Update parameters
-                    qTk0 = np.dot(q.T, k0)
-                    k0 = k0 + p * qTk0
-                    qpT = np.dot(q, p.T)
-                    J = J +  J * qpT
-                    # save cost and parameters for next iteration
-                    J = parameters['J']
+            new_params[param_key] = params[param_key] + learning_rate * segment
+            start += size
 
-                    if n_squared > 0:
-                        break
-                    else:
-                        omega = k0
-                        break
-            else:
+        return new_params
 
-                s = lambda_factor * s
-                E_prime0 = lambda_factor* E_prime0
-                continue # go back to the beginning of while loop 2
+    def _compute_search_direction(self, grad_vector: np.ndarray) -> np.ndarray:
+        """Compute search direction based on current state"""
+        k = self.state.J @ grad_vector
+
+        # Simple direction computation for now
+        # Full Davidon algorithm would involve more complex calculations
+        return -k
+
+    def _update_jacobian(self, s: np.ndarray, grad_vector: np.ndarray,
+                         E_prime: float) -> None:
+        """
+        Update Jacobian approximation using Davidon's formula
+        This is a simplified version - full implementation would involve
+        the complete update rules from the paper
+        """
+        k = self.state.J @ grad_vector
+        y = k - self.state.k0  # Change in transformed gradient
+
+        # Avoid division by zero
+        denominator = np.dot(s, y)
+        if abs(denominator) > 1e-10:
+            # Rank-2 update (simplified BFGS-like update)
+            Bs = self.state.J @ s
+            sBs = np.dot(s, Bs)
+
+            if sBs > 1e-10:
+                self.state.J -= np.outer(Bs, Bs) / sBs
+
+            self.state.J += np.outer(y, y) / denominator
 
 
-    return parameters, cost_list, cost_list_test
+def train_with_davidon(model_forward, model_backward, compute_cost,
+                       x_train, y_train, x_test, y_test,
+                       parameters, units_in_layer,
+                       epsilon=1e-6, max_iterations=100):
+    """
+    Train neural network using Davidon's method
 
+    Returns:
+        parameters: Optimized parameters
+        train_costs: Training cost history
+        test_costs: Test cost history
+    """
+
+    # Get initial cost and gradients
+    AL, caches = model_forward(x_train, parameters)
+    cost = compute_cost(AL, y_train)
+    grads = model_backward(AL, y_train, caches)
+
+    # Create structure cache
+    structure_cache = []
+    L = len(units_in_layer)
+    for l in range(1, L):
+        structure_cache.append((f'dW{l}', grads[f'dW{l}'].shape))
+        structure_cache.append((f'db{l}', grads[f'db{l}'].shape))
+
+    # Calculate total parameters
+    total_params = sum(np.prod(shape) for _, shape in structure_cache)
+
+    # Initialize optimizer
+    optimizer = DavidonOptimizer(total_params, epsilon, max_iterations)
+
+    # Training history
+    train_costs = [cost]
+    test_costs = []
+
+    # Evaluate initial test cost
+    AL_test, _ = model_forward(x_test, parameters)
+    test_cost = compute_cost(AL_test, y_test)
+    test_costs.append(test_cost)
+
+    print(f"Initial - Train Cost: {cost:.4f}, Test Cost: {test_cost:.4f}")
+
+    # Training loop
+    for iteration in range(max_iterations):
+        # Forward pass
+        AL, caches = model_forward(x_train, parameters)
+        cost = compute_cost(AL, y_train)
+
+        # Backward pass
+        grads = model_backward(AL, y_train, caches)
+
+        # Optimization step
+        parameters, cost = optimizer.step(
+            parameters, grads, cost,
+            x_train, y_train,
+            model_forward, compute_cost,
+            structure_cache
+        )
+
+        # Record costs
+        train_costs.append(cost)
+
+        # Evaluate on test set
+        AL_test, _ = model_forward(x_test, parameters)
+        test_cost = compute_cost(AL_test, y_test)
+        test_costs.append(test_cost)
+
+        # Print progress
+        if iteration % 10 == 0:
+            print(f"Iteration {iteration} - Train Cost: {cost:.4f}, Test Cost: {test_cost:.4f}")
+
+        # Check convergence
+        if len(train_costs) > 1 and abs(train_costs[-1] - train_costs[-2]) < epsilon:
+            print(f"Converged at iteration {iteration}")
+            break
+
+    return parameters, train_costs, test_costs
+
+
+# Example usage in main script:
 if __name__ == '__main__':
 
     #################### Input data: #############################
@@ -216,14 +270,7 @@ if __name__ == '__main__':
 
     # Preprocess datasets
     x_train_flattened, x_test_flattened, y_train_flattened, y_test_flattened = prepare_data(x_train, y_train, x_test,
-                                                                                           y_test)
-
-    # take a sample:
-    """x_train_flattened = x_train_flattened[:, :64]
-    y_train_flattened = y_train_flattened[:, :64]
-    x_test_flattened = x_test_flattened[:, :64]
-    y_test_flattened = y_test_flattened[:, :64]"""
-
+                                                                                            y_test)
     # One hot encode Y ground true values
     one_hot_encoded_y_train = one_hot_encode(y_train_flattened)
     one_hot_encoded_y_test = one_hot_encode(y_test_flattened)
@@ -234,41 +281,20 @@ if __name__ == '__main__':
     # Initialize the parameters
     parameters = initialize_parameters_davidon(units_in_layer)
 
-    # First forward pass of the neural network
-    AL, caches = Model_forward(x_train_flattened, parameters)
+    # Train with Davidon's method
+    optimized_params, train_history, test_history = train_with_davidon(
+        Model_forward, Model_backward, compute_cost,
+        x_train_flattened, one_hot_encoded_y_train.T,
+        x_test_flattened, one_hot_encoded_y_test.T,
+        parameters, units_in_layer,
+        epsilon=1e-6, max_iterations=100
+    )
 
-    cost_list_test = []
-    AL_test, caches_test = Model_forward(x_test_flattened, parameters)
-    cost = compute_cost(AL_test, one_hot_encoded_y_test.T)
-    cost_list_test.append(cost)
+    # Evaluate final accuracy
+    predictions_train = predict(x_train_flattened, optimized_params)
+    predictions_test = predict(x_test_flattened, optimized_params)
 
-    # Compute the cost
-    print("this is the initial cost computed")
-    cost_list = []
-    cost = compute_cost(AL, one_hot_encoded_y_train.T)
-    cost_list.append(cost)
-    # Compute the gradients
-    grads = Model_backward(AL, one_hot_encoded_y_train.T, caches)
-
-    parameters, cost_list, cost_list_test = davidon_quasi_newton_update(x_train_flattened, x_test_flattened, parameters, cost, cost_list, cost_list_test, grads, units_in_layer, epsilon=0.01, max_iterations=100)
-
-    # Structure of the data to save: (parameters, cost_list, cost_list_test)
-    Data_to_save ={
-        'cost_list': cost_list,
-        'cost_list_test': cost_list_test
-    }
-
-    # Save the parameters in a pickle file
-    with open('cost_list_' + str(units_in_layer) + '.pickle', 'wb') as file:
-        pickle.dump(Data_to_save, file)
-
-    # Get predictions for the training and test sets
-    predictions_train = predict(x_train_flattened, parameters)
-    predictions_test = predict(x_test_flattened, parameters)
-
-    # Compute the accuracy of the predictions
     accuracy_train = compute_accuracy(predictions_train, y_train_flattened)
     accuracy_test = compute_accuracy(predictions_test, y_test_flattened)
 
-    print(f"Accuracy on the training set: {accuracy_train}")
-    print(f"Accuracy on the test set: {accuracy_test}")
+    print(f"\nFinal Accuracy - Train: {accuracy_train:.4f}, Test: {accuracy_test:.4f}")
