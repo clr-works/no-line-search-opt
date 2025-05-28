@@ -6,7 +6,7 @@ import time
 import pickle
 
 @profile
-def initialize_parameters_davidon(units_in_layer, dtype=np.float16):
+def initialize_parameters_davidon(units_in_layer, dtype=np.float32):
     """
     Initializes network parameters using He initialization, and prepares for Davidson's algorithm
 

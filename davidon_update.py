@@ -16,9 +16,11 @@ class DavidonState:
     """Maintains state for Davidon's algorithm"""
     J: np.ndarray  # Jacobian/Hessian approximation
     k0: np.ndarray  # Previous gradient transformed by J
-    omega: np.ndarray  # Auxiliary vector
+    omega: np.ndarray  # Auxiliary vector for Davidon's algorithm
     E0: float  # Previous cost
     E_prime0: float  # Previous directional derivative
+    s0: np.ndarray  # Previous search direction
+    g0: np.ndarray  # Previous gradient
 
 
 class DavidonDebugger:
@@ -162,19 +164,21 @@ class DavidonOptimizer:
         self.max_backtracks = 10  # Limit backtracking iterations
         self.gradient_descent_count = 0  # Track fallbacks
         self.debug = debug
+        self.J_initialized = False  # Track if J has been properly scaled
 
         if self.debug:
             self.debugger = DavidonDebugger()
 
-        # Initialize with scaled identity for better conditioning
-        # Scale based on expected gradient magnitude
-        scale = 0.1  # Conservative initial scale
+        # Don't initialize J yet - wait for first gradient
+        self.total_params = total_params
         self.state = DavidonState(
-            J=np.eye(total_params, dtype=np.float32) * scale,
+            J=None,  # Will initialize based on first gradient
             k0=None,
             omega=None,
             E0=float('inf'),
-            E_prime0=0
+            E_prime0=0,
+            s0=None,
+            g0=None
         )
 
     def step(self, parameters: Dict, grads: Dict, cost: float,
@@ -199,6 +203,22 @@ class DavidonOptimizer:
         # Flatten gradients
         grad_vector = self._flatten_gradients(grads, structure_cache)
 
+        # Initialize J based on first gradient if needed
+        if not self.J_initialized:
+            grad_norm = np.linalg.norm(grad_vector)
+            if grad_norm > 1e-10:
+                # Scale J so that ||Jg|| ≈ ||g|| for initial step
+                # This gives us a reasonable initial step size
+                scale = 1.0 / grad_norm  # This makes ||Jg|| = 1 initially
+                self.state.J = np.eye(self.total_params, dtype=np.float64) * scale
+                self.J_initialized = True
+                if self.debug:
+                    print(f"Initialized J with scale={scale:.6f} based on grad_norm={grad_norm:.6f}")
+            else:
+                # Gradient too small, use default
+                self.state.J = np.eye(self.total_params, dtype=np.float64) * 0.1
+                self.J_initialized = True
+
         # DEBUG: Analyze gradient and J
         if self.debug and self.iteration < 5:
             print(f"\n=== Iteration {self.iteration} ===")
@@ -207,23 +227,41 @@ class DavidonOptimizer:
 
         # First iteration initialization
         if self.state.k0 is None:
+            self.state.g0 = grad_vector.copy()
             self.state.k0 = self.state.J @ grad_vector
             self.state.omega = self.state.k0.copy()
             self.state.E0 = cost
             if self.debug:
                 print(f"Initial k0 norm: {np.linalg.norm(self.state.k0):.6f}")
+                print(f"Initial J scaling: {np.mean(np.abs(np.diag(self.state.J))):.6f}")
 
         # Compute search direction
+        k = self.state.J @ grad_vector
+
+        # Debug: check if k is reasonable
+        if self.debug and (np.linalg.norm(k) > 1000 * np.linalg.norm(grad_vector) or
+                           np.linalg.norm(k) < 1e-6 * np.linalg.norm(grad_vector)):
+            print(
+                f"WARNING: k norm={np.linalg.norm(k):.6f} is unreasonable compared to grad norm={np.linalg.norm(grad_vector):.6f}")
+            print(f"J matrix may be ill-conditioned")
+
+            # Reset J to scaled identity if it's too bad
+            if np.linalg.norm(k) > 10000 * np.linalg.norm(grad_vector):
+                print("RESETTING J matrix to scaled identity")
+                scale = 0.1 / np.linalg.norm(grad_vector)
+                self.state.J = np.eye(len(grad_vector), dtype=np.float64) * scale
+                k = self.state.J @ grad_vector
+
         if self.iteration == 0:
-            s = -self.state.k0
+            s = -k  # First iteration: simple gradient descent direction
         else:
-            s = self._compute_search_direction(grad_vector)
+            s = -k  # Use transformed gradient as search direction
 
         if self.debug:
             print(f"Search direction norm: {np.linalg.norm(s):.6f}")
 
         # Check convergence
-        E_prime0 = np.dot(self.state.k0, s)
+        E_prime0 = np.dot(grad_vector, s)
         if self.debug:
             print(f"E_prime0 (directional derivative): {E_prime0:.6f}")
 
@@ -232,9 +270,10 @@ class DavidonOptimizer:
             return parameters, cost
 
         # Adjust step size if needed (Davidon's condition)
-        if 4 * self.state.E0 < -E_prime0:
-            s = -4 * s * (self.state.E0 / E_prime0)
-            E_prime0 = np.dot(self.state.k0, s)
+        if self.state.E0 < float('inf') and 4 * self.state.E0 < -E_prime0:
+            adjustment = -4 * self.state.E0 / E_prime0
+            s = s * adjustment
+            E_prime0 = np.dot(grad_vector, s)
             if self.debug:
                 print(f"Adjusted step, new E_prime0: {E_prime0:.6f}")
 
@@ -294,13 +333,18 @@ class DavidonOptimizer:
             self.debugger.log_parameters(self.iteration, new_params, grads, updates)
 
         # Update Jacobian approximation
-        if new_cost < self.state.E0:
-            self._update_jacobian(s, grad_vector, E_prime0)
+        if new_cost < self.state.E0 and self.iteration > 0 and self.state.g0 is not None:
+            self._update_jacobian_davidon(
+                s, grad_vector, self.state.g0,
+                new_cost, self.state.E0, E_prime0, self.state.E_prime0
+            )
 
         # Update state
-        self.state.k0 = self.state.J @ grad_vector
+        self.state.k0 = k.copy()
         self.state.E0 = new_cost
         self.state.E_prime0 = E_prime0
+        self.state.s0 = s.copy()
+        self.state.g0 = grad_vector.copy()
         self.iteration += 1
 
         return new_params, new_cost
@@ -364,35 +408,152 @@ class DavidonOptimizer:
         # Full Davidon algorithm would involve more complex calculations
         return -k
 
-    def _update_jacobian(self, s: np.ndarray, grad_vector: np.ndarray,
-                         E_prime: float) -> None:
+    def _update_jacobian_davidon(self, s: np.ndarray, g: np.ndarray, g_prev: np.ndarray,
+                                 E: float, E_prev: float, E_prime: float, E_prime_prev: float) -> None:
         """
-        Update Jacobian approximation using Davidon's formula
-        This is a simplified version - full implementation would involve
-        the complete update rules from the paper
+        Update Jacobian using Davidon's formula from the 1975 paper.
+
+        The key insight is that Davidon's method maintains a matrix J such that
+        J approximates (inverse Hessian)^{-1}, and updates it to maintain this property.
         """
-        k = self.state.J @ grad_vector
-        y = k - self.state.k0  # Change in transformed gradient
 
-        # Avoid division by zero
-        denominator = np.dot(s, y)
-        if abs(denominator) > 1e-10:
-            # Rank-2 update (simplified BFGS-like update)
-            Bs = self.state.J @ s
-            sBs = np.dot(s, Bs)
+        # Compute key vectors
+        y = g - g_prev  # Change in gradient
+        k = self.state.J @ g  # Current transformed gradient
+        k_prev = self.state.k0  # Previous transformed gradient
 
-            if sBs > 1e-10:
-                self.state.J -= np.outer(Bs, Bs) / sBs
+        # Davidon's parameters (from the paper)
+        # These ensure the update maintains positive definiteness
 
-            self.state.J += np.outer(y, y) / denominator
+        # Step 1: Compute m = s + k_prev - k
+        m = s + k_prev - k
+        m_norm_sq = np.dot(m, m)
+
+        # Avoid numerical issues
+        if m_norm_sq < 1e-16:
+            if self.debug:
+                print("  Warning: m vector too small, skipping J update")
+            return
+
+        # Step 2: Compute v and μ
+        v = np.dot(m, s)
+        mu = v - m_norm_sq
+
+        # Step 3: Update omega (auxiliary vector)
+        if self.state.omega is None:
+            self.state.omega = k_prev.copy()
+
+        # Compute u = omega - (m^T omega / m^T m) * m
+        m_omega = np.dot(m, self.state.omega)
+        u = self.state.omega - (m_omega / m_norm_sq) * m
+        u_norm_sq = np.dot(u, u)
+
+        # Step 4: Compute parameters for the update
+        n_sq = 0.0
+        if u_norm_sq > 1e-16:
+            # Check if m and u are sufficiently orthogonal
+            m_u = np.dot(m, u)
+            if 1e6 * (m_u ** 2) < m_norm_sq * u_norm_sq:
+                # Compute n = u - (u^T s / u^T u) * u
+                u_s = np.dot(u, s)
+                n = s - (u_s / u_norm_sq) * u
+                n_sq = np.dot(u, s) ** 2 / u_norm_sq
+
+        # Step 5: Compute b parameter
+        b = n_sq - (mu * v) / m_norm_sq
+
+        # Step 6: Determine update parameters α, γ, δ
+        if b > self.epsilon:
+            # Case 1: b is sufficiently positive
+            alpha = v / m_norm_sq
+            gamma = 0
+            delta = np.sqrt(v / mu) if mu > 0 else 0
+        else:
+            # Case 2: b is small or negative
+            a = b - mu
+            c = b + v
+
+            if abs(a) > 1e-16 and mu * v < m_norm_sq * n_sq:
+                # Compute gamma to ensure positive definiteness
+                discriminant = 1 - (mu * v) / (m_norm_sq * n_sq)
+                if discriminant > 0:
+                    gamma = np.sqrt(discriminant) / abs(a)
+                else:
+                    gamma = 0
+
+                if c < a:
+                    gamma = -gamma
+
+                delta = 0 if abs(mu) < 1e-16 else np.sqrt(abs(v / mu))
+                alpha = (v + mu * delta) / (m_norm_sq * (1 + gamma * n_sq))
+            else:
+                # Fallback to simple update
+                gamma = 0
+                delta = 0
+                alpha = v / m_norm_sq if m_norm_sq > 1e-16 else 0
+
+        # Step 7: Compute update vectors p and q
+        p = alpha * m + gamma * (n if 'n' in locals() else np.zeros_like(m))
+        q = m / m_norm_sq if m_norm_sq > 1e-16 else np.zeros_like(m)
+
+        # Step 8: Update J matrix
+        # Davidon's formula: J_new = J + p⊗q
+        # where ⊗ represents a specific matrix operation
+
+        # The correct Davidon update maintains J as approximation to Hessian
+        # Key insight: We need to update J such that J(y) ≈ s
+
+        # First, apply rank-one update
+        if abs(np.dot(q, k_prev)) > 1e-10:
+            # J = J + (p - Jq) ⊗ q / (q^T k_prev)
+            Jq = self.state.J @ q
+            update_vec = p - Jq
+            denominator = np.dot(q, k_prev)
+            self.state.J = self.state.J + np.outer(update_vec, q) / denominator
+        else:
+            # Simpler update when q^T k_prev is too small
+            if m_norm_sq > 1e-10:
+                # Use Sherman-Morrison-like update
+                self.state.J = self.state.J + alpha * np.outer(m, m) / m_norm_sq
+
+        # Step 9: Update omega for next iteration
+        q_k_prev = np.dot(q, k_prev)
+        self.state.omega = k_prev + p * q_k_prev
+
+        if self.debug and self.iteration % 10 == 0:
+            # Check J properties
+            try:
+                # Check condition number on small subset
+                subset_size = min(50, self.state.J.shape[0])
+                J_subset = self.state.J[:subset_size, :subset_size]
+                eigvals = np.linalg.eigvalsh(J_subset)
+                cond_number = eigvals.max() / eigvals.min() if eigvals.min() > 0 else np.inf
+                print(f"  J eigenvalue range: [{eigvals.min():.2e}, {eigvals.max():.2e}]")
+                print(f"  J condition number: {cond_number:.2e}")
+
+                # Reset J if it becomes too ill-conditioned
+                if cond_number > 1e10:
+                    print("  WARNING: J is ill-conditioned, resetting to scaled identity")
+                    grad_norm = np.linalg.norm(g)
+                    scale = 1.0 / (grad_norm + 1e-10)
+                    self.state.J = np.eye(self.total_params, dtype=np.float64) * scale
+                    self.state.omega = None  # Reset omega too
+            except:
+                pass
 
 
 def train_with_davidon(model_forward, model_backward, compute_cost,
                        x_train, y_train, x_test, y_test,
                        parameters, units_in_layer,
-                       epsilon=1e-6, max_iterations=100):
+                       epsilon=1e-6, max_iterations=100,
+                       optimizer_mode="davidon_with_fallback",
+                       learning_rate=0.01):
     """
-    Train neural network using Davidon's method
+    Train neural network using Davidon's method or pure gradient descent
+
+    Args:
+        optimizer_mode: "davidon_with_fallback" or "gradient_descent"
+        learning_rate: Learning rate for gradient descent mode
 
     Returns:
         parameters: Optimized parameters
@@ -416,10 +577,6 @@ def train_with_davidon(model_forward, model_backward, compute_cost,
     # Calculate total parameters
     total_params = sum(np.prod(shape) for _, shape in structure_cache)
 
-    # Initialize optimizer with adjusted epsilon for convergence
-    # Use larger epsilon to avoid premature convergence
-    optimizer = DavidonOptimizer(total_params, epsilon=1e-4, max_iterations=max_iterations, debug=True)
-
     # Training history
     train_costs = [cost]
     test_costs = []
@@ -430,48 +587,124 @@ def train_with_davidon(model_forward, model_backward, compute_cost,
     test_costs.append(test_cost)
 
     print(f"Initial - Train Cost: {cost:.4f}, Test Cost: {test_cost:.4f}")
+    print(f"Optimizer Mode: {optimizer_mode}")
+    if optimizer_mode == "gradient_descent":
+        print(f"Learning Rate: {learning_rate}")
 
-    # Training loop
-    for iteration in range(max_iterations):
-        # Forward pass
-        AL, caches = model_forward(x_train, parameters)
-        cost = compute_cost(AL, y_train)
+    # Choose optimizer based on mode
+    if optimizer_mode == "gradient_descent":
+        # Pure gradient descent mode
+        print("\nUsing Pure Gradient Descent")
 
-        # Backward pass
-        grads = model_backward(AL, y_train, caches)
+        for iteration in range(max_iterations):
+            # Forward pass
+            AL, caches = model_forward(x_train, parameters)
+            cost = compute_cost(AL, y_train)
 
-        # Optimization step
-        parameters, cost = optimizer.step(
-            parameters, grads, cost,
-            x_train, y_train,
-            model_forward, compute_cost,
-            structure_cache
-        )
+            # Backward pass
+            grads = model_backward(AL, y_train, caches)
 
-        # Record costs
-        train_costs.append(cost)
+            # Flatten gradients
+            grad_list = []
+            for grad_key, shape in structure_cache:
+                if grad_key in grads:
+                    grad_list.append(grads[grad_key].flatten())
+            grad_vector = np.concatenate(grad_list)
 
-        # Evaluate on test set
-        AL_test, _ = model_forward(x_test, parameters)
-        test_cost = compute_cost(AL_test, y_test)
-        test_costs.append(test_cost)
+            # Gradient descent step
+            direction = -grad_vector * learning_rate
 
-        # Print progress
-        if iteration % 10 == 0:
-            print(f"Iteration {iteration} - Train Cost: {cost:.4f}, Test Cost: {test_cost:.4f}")
+            # Update parameters
+            import copy
+            new_params = copy.deepcopy(parameters)
+            if 'J' in new_params:
+                del new_params['J']
 
-        # Check convergence based on cost change, not just parameter change
-        if len(train_costs) > 10:  # Wait for some iterations
-            recent_costs = train_costs[-10:]
-            cost_variance = np.var(recent_costs)
-            if cost_variance < epsilon ** 2:
-                print(f"Converged at iteration {iteration} - cost variance: {cost_variance:.2e}")
-                break
+            start = 0
+            for grad_key, shape in structure_cache:
+                param_key = grad_key[1:]
+                size = np.prod(shape)
+                segment = direction[start:start + size].reshape(shape)
+                new_params[param_key] = parameters[param_key] + segment
+                start += size
 
-    # Save debug data before returning
-    if hasattr(optimizer, 'debugger'):
-        print("\nSaving debug data...")
-        optimizer.debugger.save_to_csv("davidon_debug")
+            parameters = new_params
+
+            # Record costs
+            train_costs.append(cost)
+
+            # Evaluate on test set
+            AL_test, _ = model_forward(x_test, parameters)
+            test_cost = compute_cost(AL_test, y_test)
+            test_costs.append(test_cost)
+
+            # Print progress
+            if iteration % 10 == 0:
+                grad_norm = np.linalg.norm(grad_vector)
+                print(
+                    f"Iteration {iteration} - Train Cost: {cost:.4f}, Test Cost: {test_cost:.4f}, Grad Norm: {grad_norm:.6f}")
+
+            # Check convergence
+            if len(train_costs) > 10:
+                recent_costs = train_costs[-10:]
+                cost_variance = np.var(recent_costs)
+                if cost_variance < epsilon ** 2:
+                    print(f"Converged at iteration {iteration} - cost variance: {cost_variance:.2e}")
+                    break
+
+        # Create dummy optimizer for compatibility
+        class DummyOptimizer:
+            def __init__(self):
+                self.iteration = iteration
+                self.gradient_descent_count = iteration  # All iterations were GD
+
+        optimizer = DummyOptimizer()
+
+    else:  # davidon_with_fallback mode
+        # Initialize optimizer with adjusted epsilon for convergence
+        optimizer = DavidonOptimizer(total_params, epsilon=1e-4, max_iterations=max_iterations, debug=True)
+
+        # Training loop
+        for iteration in range(max_iterations):
+            # Forward pass
+            AL, caches = model_forward(x_train, parameters)
+            cost = compute_cost(AL, y_train)
+
+            # Backward pass
+            grads = model_backward(AL, y_train, caches)
+
+            # Optimization step
+            parameters, cost = optimizer.step(
+                parameters, grads, cost,
+                x_train, y_train,
+                model_forward, compute_cost,
+                structure_cache
+            )
+
+            # Record costs
+            train_costs.append(cost)
+
+            # Evaluate on test set
+            AL_test, _ = model_forward(x_test, parameters)
+            test_cost = compute_cost(AL_test, y_test)
+            test_costs.append(test_cost)
+
+            # Print progress
+            if iteration % 10 == 0:
+                print(f"Iteration {iteration} - Train Cost: {cost:.4f}, Test Cost: {test_cost:.4f}")
+
+            # Check convergence based on cost change, not just parameter change
+            if len(train_costs) > 10:  # Wait for some iterations
+                recent_costs = train_costs[-10:]
+                cost_variance = np.var(recent_costs)
+                if cost_variance < epsilon ** 2:
+                    print(f"Converged at iteration {iteration} - cost variance: {cost_variance:.2e}")
+                    break
+
+        # Save debug data before returning
+        if hasattr(optimizer, 'debugger'):
+            print("\nSaving debug data...")
+            optimizer.debugger.save_to_csv("davidon_debug")
 
     return parameters, train_costs, test_costs, optimizer  # Return optimizer too
 
@@ -504,12 +737,19 @@ if __name__ == '__main__':
     parameters = initialize_parameters_davidon(units_in_layer)
 
     # Train with Davidon's method - now captures the optimizer too
+    # Choose optimizer mode: "davidon_with_fallback" or "gradient_descent"
+    OPTIMIZER_MODE = "davidon_with_fallback"  # Change this to "gradient_descent" for pure GD
+    LEARNING_RATE = 0.1  # Learning rate for gradient descent mode
+
     optimized_params, train_history, test_history, optimizer = train_with_davidon(
         Model_forward, Model_backward, compute_cost,
         x_train_flattened, one_hot_encoded_y_train.T,
         x_test_flattened, one_hot_encoded_y_test.T,
         parameters, units_in_layer,
-        epsilon=1e-6, max_iterations=100
+        epsilon=1e-6,
+        max_iterations=1000,
+        optimizer_mode=OPTIMIZER_MODE,
+        learning_rate=LEARNING_RATE
     )
 
     # Print training summary
