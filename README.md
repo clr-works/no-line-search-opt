@@ -8,14 +8,13 @@ This repository contains an implementation of the algorithm described in Davidon
 
 Unlike traditional optimization methods that rely on line searches to determine step sizes, Davidon's approach constructs a quasi-Newton method that automatically adjusts the search direction and step size based on the curvature of the objective function, leading to more efficient convergence.
 
-## Features
+### Why Davidon Struggles with Neural Networks
 
-- Implementation of Davidon's quasi-Newton update algorithm
-- Application to MNIST handwritten digit classification
-- Neural network with configurable layer sizes
-- Performance metrics including training/test accuracy and cost tracking
-- Memory profiling for optimization analysis
-
+1. **No Line Search**: Cannot correct for poor J approximations
+2. **Accumulating Errors**: Each J update compounds previous inaccuracies  
+3. **High Dimensionality**: 4,015 parameters even for tiny network
+4. **Non-Convex Landscape**: Neural network loss surfaces are challenging
+   
 ## Requirements
 
 - Python 3.x
@@ -47,7 +46,13 @@ Davidon's method focuses on constructing positive definite matrices that approxi
 
 ## Performance
 
-The implementation includes memory profiling to analyze efficiency. The algorithm typically converges in fewer iterations than gradient descent methods, especially for ill-conditioned problems.
+Davidon's method is theoretically elegant but practically fragile. While it can achieve impressive initial progress, it lacks the robustness needed for modern machine learning. The method serves as an important historical milestone and educational tool, demonstrating why line searches and limited-memory approaches (like L-BFGS) became standard.
+
+### Hybrid Approach Potential
+Our experiments suggest a practical hybrid:
+1. Use Davidon for initial rapid descent
+2. Switch to Adam/L-BFGS when progress stalls
+3. Monitor condition number of J as switching criterion
 
 ## References
 
